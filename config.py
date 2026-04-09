@@ -53,8 +53,14 @@ DB_PATH: str = os.getenv("DB_PATH", "autopoly.db")
 # ---------------------------------------------------------------------------
 # Strategy
 # ---------------------------------------------------------------------------
-STRATEGY_NAME: str = os.getenv("STRATEGY_NAME", "pattern")  # active strategy
+STRATEGY_NAME: str = os.getenv("STRATEGY_NAME", "ml")  # active strategy
 COINBASE_CANDLE_URL: str = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
+
+# ---------------------------------------------------------------------------
+# ML Strategy
+# ---------------------------------------------------------------------------
+ML_MODEL_PATH: str = os.getenv("ML_MODEL_PATH", "models/btc_ensemble_v3.lgb")
+ML_THRESHOLD: float = float(os.getenv("ML_THRESHOLD", "0.590"))
 
 # ---------------------------------------------------------------------------
 # Signal Timing
