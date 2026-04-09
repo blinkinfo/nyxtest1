@@ -1,0 +1,612 @@
+================================================================================
+ENSEMBLE V3 — ML STRATEGY IMPLEMENTATION GUIDE
+================================================================================
+Target Repo: nyxtest1 (Polymarket BTC 5m Binary Options Bot)
+Goal: Replace the PatternStrategy with a LightGBM ML model strategy
+Reference: BLUEPRINT.txt (the model specification)
+
+This guide tells you EXACTLY what to change, what to create, and what NOT to
+touch. Follow it step by step. Do not improvise or add features not described.
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+1. ARCHITECTURE OVERVIEW — How the repo works (read-only context)
+2. NEW FILES TO CREATE — All new files and their exact contents
+3. FILES TO MODIFY — Surgical edits to existing files
+4. FILES NOT TO TOUCH — Do not change these
+5. DEPENDENCY CHANGES — requirements.txt additions
+6. ENVIRONMENT VARIABLES — New .env entries
+7. TESTING CHECKLIST — How to verify the implementation
+8. COMMON MISTAKES TO AVOID — Critical pitfalls
+
+================================================================================
+SECTION 1: ARCHITECTURE OVERVIEW (READ-ONLY CONTEXT)
+================================================================================
+
+The bot has a pluggable strategy system:
+
+  core/strategies/base.py      — BaseStrategy ABC: async check_signal() -> dict | None
+  core/strategies/__init__.py  — Registry: STRATEGY_REGISTRY = {'pattern': PatternStrategy}
+  core/strategy.py             — Orchestrator: lazy-loads strategy by cfg.STRATEGY_NAME
+  core/scheduler.py            — Calls strategy.check_signal() at T-85s every 5 min
+
+Signal flow:
+  1. scheduler._check_and_trade() fires at T-85s before each 5-min slot ends
+  2. Calls strategy.check_signal() → delegates to active strategy
+  3. Strategy returns:
+     - None → hard failure (error logged, slot skipped)
+     - {skipped: True, reason: str, slot_n1_*: ...} → no trade signal
+     - {skipped: False, side: 'Up'|'Down', entry_price, opposite_price,
+        token_id, pattern, slot_n1_*: ...} → trade signal
+  4. Scheduler inserts signal to DB, optionally places trade, schedules resolution
+
+The strategy's job is ONLY to return this dict. It does NOT place trades,
+talk to Telegram, or touch the DB. The scheduler handles all of that.
+
+Key signal dict fields (non-skip):
+  - skipped: False
+  - side: 'Up' or 'Down'
+  - entry_price: float (Polymarket ask price for chosen side)
+  - opposite_price: float (Polymarket ask price for other side)
+  - token_id: str (Polymarket CLOB token ID for chosen side)
+  - pattern: str (for DB logging — we'll use 'ML_UP' or 'ML_DOWN')
+  - slot_n1_start_full: str (e.g., '2024-01-15 12:05:00 UTC')
+  - slot_n1_end_full: str (e.g., '2024-01-15 12:10:00 UTC')
+  - slot_n1_start_str: str (e.g., '12:05')
+  - slot_n1_end_str: str (e.g., '12:10')
+  - slot_n1_ts: int (unix timestamp of slot start)
+  - slot_n1_slug: str (e.g., 'btc-updown-5m-1705315500')
+
+Key signal dict fields (skip):
+  - skipped: True
+  - reason: str (e.g., 'ML confidence below threshold (0.54)')
+  - pattern: None
+  - slot_n1_start_full, slot_n1_end_full, slot_n1_start_str, slot_n1_end_str, slot_n1_ts: same
+
+Polymarket helpers (already exist, just import and use):
+  from polymarket.markets import get_next_slot_info, get_slot_prices
+  - get_next_slot_info() → {slug, start_full, end_full, start_str, end_str, ts}
+  - get_slot_prices(slug) → {up_price, down_price, up_token_id, down_token_id}
+
+
+================================================================================
+SECTION 2: NEW FILES TO CREATE
+================================================================================
+
+Create these files exactly as specified.
+
+────────────────────────────────────────────────────────────────────────────────
+FILE 2.1: core/strategies/ml_strategy.py
+────────────────────────────────────────────────────────────────────────────────
+
+This is the main new file. It replaces PatternStrategy as the active strategy.
+
+Structure:
+  class MLStrategy(BaseStrategy):
+      def __init__(self):
+          - Load LightGBM model from cfg.ML_MODEL_PATH
+          - Initialize ccxt MEXC spot + futures exchanges
+          - Store threshold from cfg.ML_THRESHOLD (default 0.590)
+
+      async def check_signal(self) -> dict | None:
+          - Step 1: Get next slot info from Polymarket
+          - Step 2: Fetch live MEXC data (5m spot, 15m futures, 1h futures, funding, CVD)
+          - Step 3: Build the 25 features (exact formulas below)
+          - Step 4: Run model prediction
+          - Step 5: Apply threshold → UP / DOWN / SKIP
+          - Step 6: If not skip, get Polymarket prices
+          - Step 7: Return standard signal dict
+
+CRITICAL — Feature Engineering (25 features, exact formulas):
+
+  All features MUST use data from candle N-1 or earlier. Candle N is live/incomplete.
+
+  Helper — ATR14:
+    def _atr14(self, df: pd.DataFrame) -> pd.Series:
+        h, l, c_prev = df['high'], df['low'], df['close'].shift(1)
+        tr = pd.concat([h - l, (h - c_prev).abs(), (l - c_prev).abs()], axis=1).max(axis=1)
+        return tr.rolling(14).mean()
+
+  A. 5-Minute Candle Structure (9 features):
+     Compute on the 5m spot OHLCV dataframe:
+       atr = _atr14(df_5m)  — do NOT shift atr here
+       body = df_5m['close'] - df_5m['open']
+       upper_wick = df_5m['high'] - df_5m[['open','close']].max(axis=1)
+       lower_wick = df_5m[['open','close']].min(axis=1) - df_5m['low']
+       vol_ma = df_5m['volume'].rolling(20).mean()
+
+       body_ratio_n1   = (body / atr).iloc[-2]    # N-1 candle
+       body_ratio_n2   = (body / atr).iloc[-3]    # N-2 candle
+       body_ratio_n3   = (body / atr).iloc[-4]    # N-3 candle
+       upper_wick_n1   = (upper_wick / atr).iloc[-2]
+       upper_wick_n2   = (upper_wick / atr).iloc[-3]
+       lower_wick_n1   = (lower_wick / atr).iloc[-2]
+       lower_wick_n2   = (lower_wick / atr).iloc[-3]
+       volume_ratio_n1 = (df_5m['volume'] / vol_ma).iloc[-2]
+       volume_ratio_n2 = (df_5m['volume'] / vol_ma).iloc[-3]
+
+     NOTE: In live inference, iloc[-1] is the live candle N (incomplete).
+     iloc[-2] is N-1 (last closed), iloc[-3] is N-2, etc.
+     The ATR14 at iloc[-2] already incorporates candle N-1 and earlier,
+     which is correct because ATR is computed on the whole series and we
+     read it at the N-1 position.
+
+  B. 15-Minute Futures Features (3 features):
+     Compute on the 15m futures OHLCV dataframe:
+       atr_15m = _atr14(df_15m)
+       last_closed_idx = -2 if the last 15m candle is still live, else -1
+       (Determine by checking if df_15m.iloc[-1].datetime + 15min > now)
+
+       body_ratio_15m   = ((df_15m['close'] - df_15m['open']) / atr_15m).iloc[last_closed_idx]
+       dir_15m          = 1 if df_15m['close'].iloc[last_closed_idx] > df_15m['open'].iloc[last_closed_idx] else -1
+       volume_ratio_15m = (df_15m['volume'] / df_15m['volume'].rolling(20).mean()).iloc[last_closed_idx]
+
+  C. 1-Hour Futures Features (3 features):
+     Compute on the 1h futures OHLCV dataframe:
+       atr_1h = _atr14(df_1h)
+       last_closed_idx = -2 if the last 1h candle is still live, else -1
+
+       body_ratio_1h  = ((df_1h['close'] - df_1h['open']) / atr_1h).iloc[last_closed_idx]
+       dir_1h         = 1 if df_1h['close'].iloc[last_closed_idx] > df_1h['open'].iloc[last_closed_idx] else -1
+       ema9 = df_1h['close'].ewm(span=9, adjust=False).mean()
+       ema9_slope_1h  = ((ema9 - ema9.shift(1)) / atr_1h).iloc[last_closed_idx]
+
+  D. Funding Rate Features (2 features):
+     Fetch latest funding rate from ccxt futures:
+       funding_rate = latest funding rate value (float)
+       funding_zscore: compute rolling z-score over last 50 values of funding rate
+         If std == 0, zscore = 0.0
+
+  E. CVD Features (5 features):
+     Fetch 5m klines from MEXC futures REST API (NOT ccxt):
+       URL: https://contract.mexc.com/api/v1/contract/kline/BTC_USDT
+       Params: interval=Min5, start=<unix_sec>, end=<unix_sec>
+       Response: {"success": true, "data": {"time":[], "open":[], "high":[], "low":[], "close":[], "vol":[]}}
+
+       For each candle:
+         buy_vol = vol * (close - low) / (high - low)
+         sell_vol = vol * (high - close) / (high - low)
+         (if high == low: buy_vol = sell_vol = vol / 2)
+
+       delta = buy_vol - sell_vol (per candle)
+
+       Using the LAST CLOSED CVD candle (N-1 equivalent):
+         delta_ratio = delta / volume  (of that candle)
+         cvd_delta   = delta           (of that candle)
+         cvd_5       = sum of delta for last 5 closed candles
+         cvd_20      = sum of delta for last 20 closed candles
+         cvd_trend   = cvd_5 - cvd_20
+
+  F. Time Features (3 features):
+     Based on the current UTC time (when the prediction is made):
+       hour = utc_hour + utc_minute / 60.0
+       hour_sin    = sin(2 * pi * hour / 24)
+       hour_cos    = cos(2 * pi * hour / 24)
+       day_of_week = weekday (0=Monday, 6=Sunday)
+
+  FEATURE ORDER (must match training exactly — this is the order the model expects):
+    [
+      'body_ratio_n1', 'body_ratio_n2', 'body_ratio_n3',
+      'upper_wick_n1', 'upper_wick_n2',
+      'lower_wick_n1', 'lower_wick_n2',
+      'volume_ratio_n1', 'volume_ratio_n2',
+      'body_ratio_15m', 'dir_15m', 'volume_ratio_15m',
+      'body_ratio_1h', 'dir_1h', 'ema9_slope_1h',
+      'funding_rate', 'funding_zscore',
+      'delta_ratio', 'cvd_delta', 'cvd_5', 'cvd_20', 'cvd_trend',
+      'hour_sin', 'hour_cos', 'day_of_week',
+    ]
+
+  PREDICTION LOGIC:
+    prob = model.predict(features_array)[0]  # P(UP)
+    if prob > THRESHOLD (0.590):
+        side = 'Up', pattern = 'ML_UP'
+    elif prob < (1 - THRESHOLD) (0.410):
+        side = 'Down', pattern = 'ML_DOWN'
+    else:
+        return skip dict with reason = f'ML confidence below threshold ({prob:.3f})'
+
+DATA FETCHING DETAILS:
+
+  For live inference, you do NOT need 6 months of data. You need just enough
+  for the rolling windows to compute:
+  - 5m spot: last 50 candles (~4h) — enough for ATR14 + shift(3) + vol_ma(20)
+  - 15m futures: last 30 candles (~7.5h) — enough for ATR14 + vol_ma(20)
+  - 1h futures: last 25 candles (~25h) — enough for ATR14 + EMA9
+  - Funding: last 10 records — enough for rolling z-score context
+  - CVD: last 30 candles (~2.5h) — enough for rolling(20).sum()
+
+  Use ccxt with MEXC (no API key needed for public endpoints):
+    spot_exchange = ccxt.mexc({'enableRateLimit': True})
+    futures_exchange = ccxt.mexc({'enableRateLimit': True, 'options': {'defaultType': 'swap'}})
+
+  For CVD, use httpx (async):
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(
+            'https://contract.mexc.com/api/v1/contract/kline/BTC_USDT',
+            params={'interval': 'Min5', 'start': start_sec, 'end': end_sec}
+        )
+
+  IMPORTANT: ccxt fetch_ohlcv is synchronous. Wrap in asyncio.to_thread():
+    candles = await asyncio.to_thread(exchange.fetch_ohlcv, symbol, timeframe, since, limit)
+
+  IMPORTANT: Load markets once in __init__, not on every call:
+    self.spot_exchange.load_markets()
+    self.futures_exchange.load_markets()
+
+  IMPORTANT: The model file is loaded once in __init__:
+    import lightgbm as lgb
+    self.model = lgb.Booster(model_file=cfg.ML_MODEL_PATH)
+
+ERROR HANDLING:
+  - If ANY data fetch fails → log.error, return None (scheduler treats as hard fail)
+  - If feature computation produces NaN → log.warning, return skip dict
+  - If model prediction fails → log.error, return None
+  - Wrap entire check_signal() in try/except → return None on unexpected errors
+
+FULL check_signal() PSEUDOCODE:
+
+  async def check_signal(self) -> dict | None:
+      try:
+          # 1. Slot info
+          slot = await asyncio.to_thread(get_next_slot_info)
+          if slot is None:
+              log.error("Could not get next slot info")
+              return None
+
+          base = {
+              'slot_n1_start_full': slot['start_full'],
+              'slot_n1_end_full':   slot['end_full'],
+              'slot_n1_start_str':  slot['start_str'],
+              'slot_n1_end_str':    slot['end_str'],
+              'slot_n1_ts':         slot['ts'],
+              'slot_n1_slug':       slot['slug'],
+          }
+
+          # 2. Fetch data (all 5 sources)
+          df_5m = await self._fetch_5m_spot()
+          df_15m = await self._fetch_15m_futures()
+          df_1h = await self._fetch_1h_futures()
+          funding_data = await self._fetch_funding()
+          cvd_data = await self._fetch_cvd()
+
+          if any(x is None for x in [df_5m, df_15m, df_1h, funding_data, cvd_data]):
+              log.error("Data fetch failed for one or more sources")
+              return None
+
+          # 3. Build features
+          features = self._build_features(df_5m, df_15m, df_1h, funding_data, cvd_data)
+          if features is None:
+              return {**base, 'skipped': True, 'reason': 'Feature computation failed (NaN)', 'pattern': None}
+
+          # 4. Predict
+          import numpy as np
+          prob = self.model.predict(np.array([features]))[0]
+          log.info("ML prediction: P(UP) = %.4f", prob)
+
+          # 5. Threshold
+          if prob > self.threshold:
+              side = 'Up'
+              pattern = 'ML_UP'
+          elif prob < (1 - self.threshold):
+              side = 'Down'
+              pattern = 'ML_DOWN'
+          else:
+              return {
+                  **base,
+                  'skipped': True,
+                  'reason': f'ML confidence below threshold ({prob:.3f})',
+                  'pattern': None,
+              }
+
+          # 6. Polymarket prices
+          prices = await asyncio.to_thread(get_slot_prices, slot['slug'])
+          if prices is None:
+              log.error("Could not get Polymarket prices for slug %s", slot['slug'])
+              return None
+
+          if side == 'Up':
+              entry_price = prices['up_price']
+              opposite_price = prices['down_price']
+              token_id = prices['up_token_id']
+          else:
+              entry_price = prices['down_price']
+              opposite_price = prices['up_price']
+              token_id = prices['down_token_id']
+
+          # 7. Return signal
+          return {
+              **base,
+              'skipped': False,
+              'side': side,
+              'entry_price': entry_price,
+              'opposite_price': opposite_price,
+              'token_id': token_id,
+              'pattern': pattern,
+          }
+
+      except Exception:
+          log.exception("MLStrategy.check_signal() unexpected error")
+          return None
+
+
+────────────────────────────────────────────────────────────────────────────────
+FILE 2.2: models/btc_ensemble_v3.lgb
+────────────────────────────────────────────────────────────────────────────────
+
+Create directory: models/
+Copy the trained model file here. The model was trained with these exact params:
+  objective: binary, metric: binary_logloss, num_leaves: 63, max_depth: -1,
+  learning_rate: 0.01, feature_fraction: 0.8, bagging_fraction: 0.8,
+  bagging_freq: 5, min_child_samples: 50, lambda_l1: 0.1, lambda_l2: 0.1
+  num_boost_round: 1000, early_stopping_rounds: 50
+
+The model expects 25 features in the exact order listed in Section 2.1.
+The model outputs P(UP) — probability that the next candle closes higher.
+
+NOTE: The model file must be provided separately. It is a binary LightGBM
+booster file. Load with: lgb.Booster(model_file='models/btc_ensemble_v3.lgb')
+
+
+================================================================================
+SECTION 3: FILES TO MODIFY
+================================================================================
+
+────────────────────────────────────────────────────────────────────────────────
+MODIFY 3.1: core/strategies/__init__.py
+────────────────────────────────────────────────────────────────────────────────
+
+Current content (approximately):
+  from core.strategies.pattern_strategy import PatternStrategy
+  STRATEGY_REGISTRY = {'pattern': PatternStrategy}
+
+Change to:
+  from core.strategies.pattern_strategy import PatternStrategy
+  from core.strategies.ml_strategy import MLStrategy
+
+  STRATEGY_REGISTRY = {
+      'pattern': PatternStrategy,
+      'ml': MLStrategy,
+  }
+
+This adds 'ml' as a new strategy option. The PatternStrategy is KEPT for
+fallback — do NOT delete it or its file.
+
+
+────────────────────────────────────────────────────────────────────────────────
+MODIFY 3.2: config.py
+────────────────────────────────────────────────────────────────────────────────
+
+Add these new config variables (at the bottom, or in the appropriate section):
+
+  # ML Strategy
+  ML_MODEL_PATH = os.getenv("ML_MODEL_PATH", "models/btc_ensemble_v3.lgb")
+  ML_THRESHOLD = float(os.getenv("ML_THRESHOLD", "0.590"))
+
+Also change the default STRATEGY_NAME:
+  STRATEGY_NAME = os.getenv("STRATEGY_NAME", "ml")
+                                                ^^^^  change from 'pattern' to 'ml'
+
+
+────────────────────────────────────────────────────────────────────────────────
+MODIFY 3.3: .env.example
+────────────────────────────────────────────────────────────────────────────────
+
+Add these lines:
+
+  # ML Strategy
+  STRATEGY_NAME=ml
+  ML_MODEL_PATH=models/btc_ensemble_v3.lgb
+  ML_THRESHOLD=0.590
+
+
+────────────────────────────────────────────────────────────────────────────────
+MODIFY 3.4: requirements.txt
+────────────────────────────────────────────────────────────────────────────────
+
+Add these packages (if not already present):
+  ccxt
+  lightgbm
+  numpy
+  pandas
+
+httpx is already in requirements.txt — do NOT duplicate it.
+Check before adding — some may already be listed.
+
+
+────────────────────────────────────────────────────────────────────────────────
+MODIFY 3.5: .gitignore (optional)
+────────────────────────────────────────────────────────────────────────────────
+
+Add:
+  *.lgb
+
+The model file is large binary — it should be tracked via Git LFS or
+distributed separately, not committed as a regular file.
+
+
+================================================================================
+SECTION 4: FILES NOT TO TOUCH
+================================================================================
+
+Do NOT modify these files:
+  - core/strategy.py          — orchestrator, already delegates correctly
+  - core/scheduler.py         — already calls strategy.check_signal() correctly
+  - core/trader.py            — trade execution, not strategy's concern
+  - core/trade_manager.py     — trade filtering, not strategy's concern
+  - core/resolver.py          — resolution logic, not strategy's concern
+  - core/pending_queue.py     — pending slot retry queue
+  - db/models.py              — DB schema (no changes needed)
+  - db/queries.py             — DB queries (no changes needed)
+  - bot/handlers.py           — Telegram commands (no changes needed)
+  - bot/formatters.py         — message formatting (works with pattern field)
+  - polymarket/markets.py     — Polymarket API (no changes needed)
+  - main.py                   — entry point (no changes needed)
+
+The signal dict format is identical to PatternStrategy's output, so ALL
+downstream code (scheduler, trader, formatters, DB) works without changes.
+The 'pattern' field will contain 'ML_UP' or 'ML_DOWN' instead of candle
+pattern names — this is fine, the DB and formatters treat it as an opaque string.
+
+
+================================================================================
+SECTION 5: DEPENDENCY CHANGES
+================================================================================
+
+New Python packages required:
+  - ccxt          (MEXC exchange data fetching)
+  - lightgbm      (ML model inference)
+  - numpy         (feature computation)
+  - pandas        (dataframe operations)
+
+Already present in requirements.txt (do not add again):
+  - httpx          (used for CVD data from MEXC futures REST API)
+
+Install command: pip install ccxt lightgbm numpy pandas
+
+
+================================================================================
+SECTION 6: ENVIRONMENT VARIABLES
+================================================================================
+
+New variables:
+  STRATEGY_NAME=ml                              # activates the ML strategy
+  ML_MODEL_PATH=models/btc_ensemble_v3.lgb      # path to trained model file
+  ML_THRESHOLD=0.590                            # prediction confidence threshold
+
+Existing variables that remain unchanged:
+  All existing env vars (Telegram, Polymarket, DB, etc.) stay the same.
+  The ML strategy does not use Polymarket API keys for data — only for
+  getting slot prices (which uses the existing Polymarket integration).
+
+
+================================================================================
+SECTION 7: TESTING CHECKLIST
+================================================================================
+
+After implementation, verify:
+
+  [ ] 1. Model loads successfully on startup
+        - Set STRATEGY_NAME=ml in .env
+        - Start the bot
+        - Check logs for: "Strategy engine: loaded 'ml' strategy"
+        - Check logs for: "MLStrategy: model loaded from models/btc_ensemble_v3.lgb"
+
+  [ ] 2. Data fetching works
+        - Check logs for successful MEXC data fetches (5m, 15m, 1h, funding, CVD)
+        - No timeout errors or empty responses
+        - Confirm ccxt uses public endpoints (no API key needed)
+
+  [ ] 3. Feature computation produces valid numbers
+        - Log the 25 feature values on each prediction
+        - None should be NaN or infinity
+        - body_ratio values should be roughly in [-3, 3] range
+        - volume_ratio values should be roughly in [0, 5] range
+        - dir_15m and dir_1h should be exactly 1 or -1
+        - hour_sin and hour_cos should be in [-1, 1]
+        - day_of_week should be 0-6
+
+  [ ] 4. Predictions are reasonable
+        - P(UP) should be between 0 and 1
+        - Most predictions should be in 0.4-0.6 range
+        - ~40% of signals should pass the 0.590 threshold (be traded)
+
+  [ ] 5. Signal dict has all required fields
+        - side is 'Up' or 'Down'
+        - entry_price, opposite_price are valid Polymarket prices
+        - token_id is a valid Polymarket CLOB token
+        - pattern is 'ML_UP' or 'ML_DOWN'
+
+  [ ] 6. Skipped signals work correctly
+        - When prob is between 0.410 and 0.590, signal is skipped
+        - Skip reason contains the probability value
+        - Telegram receives skip notification
+
+  [ ] 7. Fallback to pattern strategy works
+        - Set STRATEGY_NAME=pattern in .env
+        - Bot should use old PatternStrategy exactly as before
+        - No errors related to ML code
+
+  [ ] 8. Feature order matches training
+        - Print the feature names when building the array
+        - Confirm they match FEATURE_COLS order from training
+
+
+================================================================================
+SECTION 8: COMMON MISTAKES TO AVOID
+================================================================================
+
+  1. WRONG FEATURE ORDER
+     The model was trained with features in a specific order.
+     If you build the array in a different order, predictions will be garbage.
+     Always use the FEATURE_COLS list from this guide.
+
+  2. USING LIVE CANDLE (N) DATA
+     The live candle is incomplete. NEVER use iloc[-1] of any OHLCV dataframe
+     for features. Always use iloc[-2] (last closed candle = N-1) or earlier.
+     The only exception: time features use the current time (when to trade).
+
+  3. WRONG CVD SOURCE
+     CVD MUST come from MEXC futures REST API via httpx.
+     URL: https://contract.mexc.com/api/v1/contract/kline/BTC_USDT
+     Do NOT compute CVD from spot OHLCV data — different formula, different data.
+
+  4. FORGETTING ATR14 NORMALIZATION
+     body_ratio and wick features are ALL divided by ATR14.
+     Without ATR normalization, feature values will be on a completely
+     different scale and the model will not work.
+
+  5. WRONG ATR14 FORMULA
+     ATR14 uses True Range, not just (high - low):
+       TR = max(high - low, |high - prev_close|, |low - prev_close|)
+       ATR14 = rolling(14).mean() of TR
+
+  6. WRONG CVD BUY/SELL VOLUME FORMULA
+     Correct:
+       buy_vol  = volume * (close - low) / (high - low)
+       sell_vol = volume * (high - close) / (high - low)
+     Handle edge case: if high == low, set buy_vol = sell_vol = volume / 2
+
+  7. SYNCHRONOUS CCXT IN ASYNC CONTEXT
+     ccxt methods are synchronous. Always wrap in asyncio.to_thread():
+       candles = await asyncio.to_thread(self.spot_exchange.fetch_ohlcv, ...)
+     Failing to do this will block the event loop and break the scheduler.
+
+  8. LOADING MODEL ON EVERY PREDICTION
+     Load the model ONCE in __init__. Do not reload it on every check_signal()
+     call — that wastes time and memory.
+
+  9. LOADING MARKETS ON EVERY PREDICTION
+     Call exchange.load_markets() ONCE in __init__, not in check_signal().
+
+  10. MISSING ERROR HANDLING ON DATA FETCHES
+      Network requests can fail. Every fetch must be wrapped in try/except.
+      On failure: log the error and return None from check_signal().
+
+  11. FUNDING RATE Z-SCORE DIVISION BY ZERO
+      Funding rate updates every 8 hours. Over short windows, rolling std
+      can be 0. When std == 0, set zscore = 0.0 (not NaN or inf).
+
+  12. NOT USING get_next_slot_info() FOR SLOT DATA
+      The strategy must use the existing Polymarket helpers to get slot info.
+      Do not compute slot timestamps manually — use get_next_slot_info().
+
+  13. CHANGING THE SIGNAL DICT FORMAT
+      The signal dict format MUST match exactly what the scheduler expects.
+      All slot_n1_* fields must be present. Do not rename or omit any field.
+
+  14. MODIFYING SCHEDULER OR TRADER CODE
+      The strategy is a drop-in replacement. It returns the same dict format.
+      There is ZERO reason to modify scheduler.py, trader.py, or any other
+      file outside the strategy layer.
+
+  15. USING PANDAS merge_asof IN LIVE INFERENCE
+      merge_asof is for batch processing (backtesting). In live inference,
+      just use iloc[-2] on the appropriate dataframe — it's simpler and faster.
+      The 15m and 1h dataframes already contain the latest closed candle.
+
+
+================================================================================
+END OF IMPLEMENTATION GUIDE
+================================================================================
